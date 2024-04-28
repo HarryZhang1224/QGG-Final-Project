@@ -1,0 +1,219 @@
+---
+title: "Final Project"
+author: "Haoxuan Zhang"
+date: "2024-04-27"
+output: pdf_document
+---
+
+# Load packages
+```{r load package, warning=FALSE, message=FALSE}
+library(ggplot2)
+library(patchwork)
+library(ggsci)
+library(latex2exp)
+library(pbmcapply)
+library(dplyr)
+library(tidyr)
+```
+
+# Read in data
+```{r read in data}
+phenotypes <- read.csv("data_files/phenotypes.csv", row.names=1)
+genotypes <- read.csv("data_files/genotypes.csv", row.names=1)
+covars <- read.csv("data_files/covars.csv", row.names=1)
+gene_info <- read.csv("data_files/gene_info.csv")
+snp_info <- read.csv("data_files/SNP_info.csv")
+```
+
+# 1 Data exploration
+## 1.a Confirm that the phenotypes conform to a normal distribution
+```{r phenotype data exploration}
+# Look at the distribution of the phenotypes
+phenotypes %>%
+  gather(key = "phenotype", value = "value") %>%
+  ggplot(aes(value)) +
+  geom_histogram(bins = 20) +
+  facet_wrap(~phenotype, scales = "free") +
+  theme_bw() +
+  xlab("Value") +
+  ylab("Count")
+```
+
+We can see that the phenotypes conform to a normal distribution, and we do not need to transform them in order to satisfy one of the assumptions of a linear regression model.
+
+## 1.b Check the genotype data and filter based on 3 standards: individuals with > 10% missing genotypes, SNPs with > 5% missing data across individuals, and SNPs with minor allele frequency < 0.05.
+```{r genotype data filtering} 
+# Calculate the proportion of missing genotypes for each individual
+missing_genotype_proportion <- apply(genotypes, 1, function(individual){
+  mean(is.na(individual))
+})
+all(missing_genotype_proportion < 0.1)
+
+missing_individual_proportion <- apply(genotypes, 2, function(genotype){
+  mean(is.na(genotype))
+})
+all(missing_individual_proportion < 0.05)
+
+MAFs <- sapply(genotypes, function(genotype){
+  freq <- sum(genotype)/(2*length(genotype))
+  ifelse(freq <= 0.5, freq, 1-freq)
+})
+all(MAFs > 0.05)
+```
+
+Genotype data has satisfied all 3 filtering standards, no additional filtering is needed.
+
+## 1.c Check if the population information provided explains the population structure in the data
+```{r check population structure, fig.width=4, fig.height=4}
+scaled_genotype <- scale(genotypes)
+pc_genotypes <- prcomp(scaled_genotype)
+pc12_genotypes <- data.frame(pc_genotypes$x[,1:2])
+pc12_genotypes$population <- covars[rownames(pc12_genotypes), "Population"]
+grouped_by_population <- ggplot(pc12_genotypes, aes(PC1, PC2, color=population)) +
+  geom_point(alpha=0.8) +
+  theme_bw() +
+  xlab("PC1") +
+  ylab("PC2") +
+  theme(aspect.ratio=1) +
+  scale_color_npg() +
+  labs(color="Population")
+
+grouped_by_population
+```
+
+We can see that the population information provided explains the population structure in the data (visually in the PCA plot). Population structure also dominates the variation captured by PC1. We can therefore directly encode the population information into our design matrix instead of incorporating PCs in the design matrix. We are now ready to proceed to association analysis.
+
+# 2 Association analysis
+## 2.a Convert genotype matrix to additive encoding and over- and under-dominance encoding.
+```{r convert genotype matrix to design matrices}
+Xa <- genotypes - 1
+Xd <- data.frame(sapply(genotypes, function(genotype){
+  homo <- genotype != 1
+  genotype[homo] <- -1
+  genotype
+}))
+rownames(Xa) <- rownames(genotypes)
+rownames(Xd) <- rownames(genotypes)
+sex_same_order <- as.factor(covars[rownames(genotypes), "Sex"])
+population_same_order <- as.factor(covars[rownames(genotypes), "Population"])
+genotype_reformatted <- list(Xa=Xa,
+                             Xd=Xd,
+                             covars=data.frame(sex=sex_same_order,
+                                               population=population_same_order))
+```
+
+## 2.b Calculate likelihood ratio test statistic
+Note that the code utilizes the pbmcapply package so that tests can be parallelized using multicore processing over the different loci. If when rerunning the code, your system does not support multicore, you can set mc.cores=1. This multicore processing might also fail when there is not enough RAM in your system. If it fails, please refer to the commented code in this block as an alternative to produce the same results.
+```{r LRT}
+doGWAS <- function(processed_genotype, y){
+  n <- length(y)
+  sex <- processed_genotype$covars$sex
+  population <- processed_genotype$covars$population
+  static_design <- data.frame(y=y, sex=sex, population=population)
+  return(pbmclapply(seq_len(ncol(processed_genotype$Xa)), function(loci_idx){
+    Xa_tmp <- processed_genotype$Xa[, loci_idx]
+    Xd_tmp <- processed_genotype$Xd[, loci_idx]
+    design_mat <- cbind(static_design, Xa=Xa_tmp, Xd=Xd_tmp)
+    
+    lm_fit <- lm(y~., data=design_mat)
+    null_lm_fit <- lm(y~sex+population, data=design_mat)
+    
+    df_theta1 <- lm_fit$rank
+    SSE_theta0 <- sum(null_lm_fit$residuals^2)
+    SSE_theta1 <- sum(lm_fit$residuals^2)
+    
+    F_stat <- ((SSE_theta0 - SSE_theta1)/2)/(SSE_theta1/(n-df_theta1))
+    pval <- pf(F_stat, 2, n-df_theta1, lower.tail=FALSE)
+    c(pval=pval, loci_idx=loci_idx)
+  }, mc.cores=15))
+}
+eQTL_res <- lapply(phenotypes, function(gene){
+  doGWAS(genotype_reformatted, gene)
+})
+```
+
+## 2.c Plot Q-Q plot for each gene
+```{r QQplot, fig.height=6, fig.width=9}
+rownames(snp_info) <- snp_info$id
+pval_gwas_res <- lapply(seq_along(eQTL_res), function(list_idx){
+  gwas_res_tmp <- eQTL_res[[list_idx]]
+  pvals <- unlist(lapply(gwas_res_tmp, function(loci){
+    loci["pval"]
+  }))
+  loci_idxs <- unlist(lapply(gwas_res_tmp, function(loci){
+    loci["loci_idx"]
+  }))
+  names(pvals) <- loci_idxs
+  expected_pvals <- -log(seq(1/length(pvals), 1, length.out=length(pvals)), base=10)
+  observed_pvals <- -log(sort(pvals, decreasing=FALSE), base=10)
+  sorted_loci_idx <- names(sort(pvals, decreasing=FALSE))
+  rsids <- colnames(genotypes)[as.integer(sorted_loci_idx)]
+  chrs <- snp_info[rsids, "chromosome"]
+  pos <- snp_info[rsids, "position"]
+  data.frame(expected=expected_pvals,
+             observed=sort(pvals, decreasing=FALSE),
+             observed_log=observed_pvals,
+             gene_name=names(eQTL_res)[list_idx],
+             rsid=rsids,
+             chr=chrs,
+             pos=pos)
+})
+pval_gwas_res_df <- do.call(rbind, pval_gwas_res)
+qqplots_all <- ggplot(pval_gwas_res_df, aes(expected, observed_log)) +
+  geom_point(alpha=0.8) +
+  geom_abline(slope=1, 
+              intercept=0,
+              linetype="dashed",
+              color="red",
+              linewidth=0.9) +
+  facet_wrap(.~gene_name, scales="free") +
+  theme_bw() +
+  xlab(TeX(r'(-log$_{10}$(Expected p-values))')) +
+  ylab(TeX(r'(-log$_{10}$(Observed p-values))'))
+qqplots_all
+```
+
+Based on the Q-Q plots for each gene, we can see that have a good model fit in this case. This is because most of the observed p-values follow a uniform distribution as expected, and the ones that are in LD with a causal loci (rejecting the null hypothesis) deviates from the distribution of p-values under the null hypothesis for some of the genes. The ones that deviate from the null form the heavy tail, which we expect in cases where we have significant hits.
+
+## 2.d Plot Manhattan plot for each gene.
+Before we plot a Manhattan plot, we need to conduct multiple testing correction. In this case, we have two levels of multiple testing. The (mostly) independent tests across SNPs, and the independent tests across genes. To do multiple testing correction, we use a global approach, where we pool the p-values for each SNP-gene pair and correct them. 
+
+I am manually creating the Manhattan plots to have more flexibilities. Ideas are from the blog post here: https://danielroelfs.com/blog/how-i-create-manhattan-plots-using-ggplot/. 
+```{r ManhattanPlot, fig.width=12, fig.height=15}
+bonf_p_threshold <- -log(0.05/nrow(pval_gwas_res_df), base=10)
+pval_gwas_res_df <- pval_gwas_res_df %>%
+  group_by(chr) %>%
+  mutate(relative_pos=pos-min(pos)+1)
+shift_bp_info <- pval_gwas_res_df %>%
+  group_by(chr) %>%
+  summarize(max_bp=max(relative_pos)) %>%
+  mutate(bp_shift=lag(cumsum(max_bp), default=0)) %>%
+  dplyr::select(chr, bp_shift)
+pval_gwas_res_df <- pval_gwas_res_df %>%
+  inner_join(shift_bp_info, by = "chr") %>%
+  mutate(bp_cum = relative_pos+bp_shift)
+pval_gwas_res_df$chr <- as.factor(pval_gwas_res_df$chr)
+pal <- pal_jco()(5)[c(1, 5)]
+pal <- rep(pal, length(unique(pval_gwas_res_df$chr))/2)
+names(pal) <- sort(unique(pval_gwas_res_df$chr))
+axis_ticks_labs <- pval_gwas_res_df %>%
+  group_by(chr) %>%
+  summarize(center=mean(bp_cum))
+axis_ticks_labs
+ggplot(pval_gwas_res_df, aes(bp_cum, observed_log, color=chr)) +
+  geom_point() +
+  facet_wrap(.~gene_name, nrow=5) +
+  geom_hline(yintercept=bonf_p_threshold,
+             linetype="dashed",
+             color="black") +
+  scale_x_continuous(
+    label = axis_ticks_labs$chr,
+    breaks = axis_ticks_labs$center
+  ) +
+  scale_color_manual(values=pal) +
+  theme_bw() +
+  theme(legend.position="none") +
+  xlab("Chromosome") +
+  ylab(TeX(r'(-log$_{10}$(p))'))
+```
+
