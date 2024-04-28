@@ -7,13 +7,17 @@ output: pdf_document
 
 # Load packages
 ```{r load package, warning=FALSE, message=FALSE}
-library(ggplot2)
-library(patchwork)
-library(ggsci)
-library(latex2exp)
-library(pbmcapply)
-library(dplyr)
-library(tidyr)
+require(ggplot2)
+require(patchwork)
+require(ggsci)
+require(latex2exp)
+require(pbmcapply)
+require(locuszoomr)
+require(EnsDb.Hsapiens.v86)
+require(biomaRt)
+require(knitr)
+require(dplyr)
+require(tidyr)
 ```
 
 # Read in data
@@ -37,6 +41,10 @@ phenotypes %>%
   theme_bw() +
   xlab("Value") +
   ylab("Count")
+ggsave("figures/hist_phenotype.png",
+       dpi=800,
+       height=4,
+       width=6)
 ```
 
 We can see that the phenotypes conform to a normal distribution, and we do not need to transform them in order to satisfy one of the assumptions of a linear regression model.
@@ -79,6 +87,10 @@ grouped_by_population <- ggplot(pc12_genotypes, aes(PC1, PC2, color=population))
   labs(color="Population")
 
 grouped_by_population
+ggsave("figures/pca.png",
+       dpi=800,
+       height=3,
+       width=3)
 ```
 
 We can see that the population information provided explains the population structure in the data (visually in the PCA plot). Population structure also dominates the variation captured by PC1. We can therefore directly encode the population information into our design matrix instead of incorporating PCs in the design matrix. We are now ready to proceed to association analysis.
@@ -171,6 +183,10 @@ qqplots_all <- ggplot(pval_gwas_res_df, aes(expected, observed_log)) +
   xlab(TeX(r'(-log$_{10}$(Expected p-values))')) +
   ylab(TeX(r'(-log$_{10}$(Observed p-values))'))
 qqplots_all
+ggsave("figures/qqplots.png",
+       dpi=800,
+       height=4,
+       width=6)
 ```
 
 Based on the Q-Q plots for each gene, we can see that have a good model fit in this case. This is because most of the observed p-values follow a uniform distribution as expected, and the ones that are in LD with a causal loci (rejecting the null hypothesis) deviates from the distribution of p-values under the null hypothesis for some of the genes. The ones that deviate from the null form the heavy tail, which we expect in cases where we have significant hits.
@@ -179,7 +195,8 @@ Based on the Q-Q plots for each gene, we can see that have a good model fit in t
 Before we plot a Manhattan plot, we need to conduct multiple testing correction. In this case, we have two levels of multiple testing. The (mostly) independent tests across SNPs, and the independent tests across genes. To do multiple testing correction, we use a global approach, where we pool the p-values for each SNP-gene pair and correct them. 
 
 I am manually creating the Manhattan plots to have more flexibilities. Ideas are from the blog post here: https://danielroelfs.com/blog/how-i-create-manhattan-plots-using-ggplot/. 
-```{r ManhattanPlot, fig.width=12, fig.height=15}
+
+```{r ManhattanPlot, fig.width=25, fig.height=10}
 bonf_p_threshold <- -log(0.05/nrow(pval_gwas_res_df), base=10)
 pval_gwas_res_df <- pval_gwas_res_df %>%
   group_by(chr) %>%
@@ -193,7 +210,7 @@ pval_gwas_res_df <- pval_gwas_res_df %>%
   inner_join(shift_bp_info, by = "chr") %>%
   mutate(bp_cum = relative_pos+bp_shift)
 pval_gwas_res_df$chr <- as.factor(pval_gwas_res_df$chr)
-pal <- pal_jco()(5)[c(1, 5)]
+pal <- pal_rickandmorty()(5)[c(3, 4)]
 pal <- rep(pal, length(unique(pval_gwas_res_df$chr))/2)
 names(pal) <- sort(unique(pval_gwas_res_df$chr))
 axis_ticks_labs <- pval_gwas_res_df %>%
@@ -201,7 +218,7 @@ axis_ticks_labs <- pval_gwas_res_df %>%
   summarize(center=mean(bp_cum))
 ggplot(pval_gwas_res_df, aes(bp_cum, observed_log, color=chr)) +
   geom_point() +
-  facet_wrap(.~gene_name, nrow=5) +
+  facet_wrap(.~gene_name, nrow=3) +
   geom_hline(yintercept=bonf_p_threshold,
              linetype="dashed",
              color="black") +
@@ -211,8 +228,83 @@ ggplot(pval_gwas_res_df, aes(bp_cum, observed_log, color=chr)) +
   ) +
   scale_color_manual(values=pal) +
   theme_bw() +
-  theme(legend.position="none") +
+  theme(legend.position="none",
+        axis.text.x=element_text(size=9),
+        axis.text.y=element_text(size=9),
+        axis.title.x=element_text(size=12),
+        axis.title.y=element_text(size=12),
+        strip.text = element_text(size=12)) +
   xlab("Chromosome") +
   ylab(TeX(r'(-log$_{10}$(p))'))
+ggsave("figures/manhattan_plot.png",
+       dpi=800,
+       height=10,
+       width=25)
+```
+
+# 3. Interpretation of Results
+## 3.a Zoom in to the significant hits and investigate
+```{r zoom in to significant hits, fig.width=15, fig.height=6, message=FALSE}
+rownames(gene_info) <- gene_info$probe
+pval_gwas_res_df %>%
+  dplyr::filter(observed_log > bonf_p_threshold) %>%
+  ungroup() -> sig_results
+sig_results$chr_int <- as.integer(sig_results$chr)
+generateLocusZoomPlot <- function(res_df, chromosome){
+  res_df <- res_df %>%
+    dplyr::filter(chr_int==chromosome) %>%
+    arrange(desc(observed_log))
+  message(res_df$chr[1])
+  gene <- gene_info[res_df$gene_name[1], "symbol"]
+  locus_object <- locus(gene=gene,
+      data=data.frame(res_df),
+      chrom="chr_int",
+      pos="pos",
+      p="observed",
+      ens_db="EnsDb.Hsapiens.v86",
+      index_snp=res_df$rsid[1],
+      labs="rsid")
+  locus_object <- link_LD(locus_object,
+                    token = "0926e60fb74e",
+                    pop=unique(covars$Population),
+                    snp=res_df$rsid[1])
+  plot <- locus_ggplot(locus_object,
+             highlight=gene) +
+  theme(aspect.ratio=1)
+  return(list(plot=plot,
+              obj=locus_object))
+}
+locus_zoom_objs <- lapply(unique(sig_results$chr_int), function(chr){
+  generateLocusZoomPlot(sig_results, chr)})
+locus_zoom_objs[[1]]$plot + locus_zoom_objs[[2]]$plot + locus_zoom_objs[[3]]$plot
+ggsave("figures/locus_zoom_plots.png",
+       dpi=800,
+       height=8,
+       width=18)
+```
+
+## 3.b SNP Annotations
+```{r snp annotations}
+mart <- useMart("ENSEMBL_MART_SNP")
+dataset <- useDataset("hsapiens_snp", mart)
+sig_rsids <- unlist(lapply(locus_zoom_objs, function(locus_obj){
+  locus_obj$obj$data$rsid
+}))
+snp_ref_info <- getBM(attributes=c('refsnp_id', 
+                                   'chrom_start',
+                                   'ensembl_gene_name', 
+                                   'consequence_type_tv',
+                                   'phenotype_name',
+                                   'phenotype_description'),
+                      filters="snp_filter",
+                      values=sig_rsids,
+                      mart=dataset)
+sig_snp_info <- kable(snp_ref_info %>%
+  dplyr::filter(nchar(phenotype_description)>0) %>%
+  dplyr::select(refsnp_id, consequence_type_tv, phenotype_description), format="latex")
+writeLines(sig_snp_info, 'data_files/significant_snps_annotations.tex')
+kable(snp_ref_info %>%
+  dplyr::filter(nchar(phenotype_description)>0) %>%
+  dplyr::select(refsnp_id, consequence_type_tv, phenotype_description))
 ```
 
