@@ -199,7 +199,6 @@ names(pal) <- sort(unique(pval_gwas_res_df$chr))
 axis_ticks_labs <- pval_gwas_res_df %>%
   group_by(chr) %>%
   summarize(center=mean(bp_cum))
-axis_ticks_labs
 ggplot(pval_gwas_res_df, aes(bp_cum, observed_log, color=chr)) +
   geom_point() +
   facet_wrap(.~gene_name, nrow=5) +
