@@ -196,7 +196,7 @@ Before we plot a Manhattan plot, we need to conduct multiple testing correction.
 
 I am manually creating the Manhattan plots to have more flexibilities. Ideas are from the blog post here: https://danielroelfs.com/blog/how-i-create-manhattan-plots-using-ggplot/. 
 
-```{r ManhattanPlot, fig.width=25, fig.height=10}
+```{r ManhattanPlot, fig.width=12, fig.height=15}
 bonf_p_threshold <- -log(0.05/nrow(pval_gwas_res_df), base=10)
 pval_gwas_res_df <- pval_gwas_res_df %>%
   group_by(chr) %>%
@@ -218,7 +218,7 @@ axis_ticks_labs <- pval_gwas_res_df %>%
   summarize(center=mean(bp_cum))
 ggplot(pval_gwas_res_df, aes(bp_cum, observed_log, color=chr)) +
   geom_point() +
-  facet_wrap(.~gene_name, nrow=3) +
+  facet_wrap(.~gene_name, nrow=5) +
   geom_hline(yintercept=bonf_p_threshold,
              linetype="dashed",
              color="black") +
@@ -238,8 +238,8 @@ ggplot(pval_gwas_res_df, aes(bp_cum, observed_log, color=chr)) +
   ylab(TeX(r'(-log$_{10}$(p))'))
 ggsave("figures/manhattan_plot.png",
        dpi=800,
-       height=10,
-       width=25)
+       height=15,
+       width=22)
 ```
 
 # 3. Interpretation of Results
